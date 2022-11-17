@@ -10,12 +10,12 @@ package org.grajagan.emporia.influxdb;
  * it under the terms of the GNU General Public License as
  * published by the Free Software Foundation, either version 3 of the
  * License, or (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public
  * License along with this program.  If not, see
  * <http://www.gnu.org/licenses/gpl-3.0.html>.
@@ -31,14 +31,17 @@ import com.influxdb.client.domain.WritePrecision;
 import com.influxdb.client.write.Point;
 import com.influxdb.query.FluxRecord;
 import com.influxdb.query.FluxTable;
+import org.apache.commons.configuration.Configuration;
 import lombok.AccessLevel;
 import lombok.Data;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
+import org.grajagan.emporia.api.EmporiaAPIService;
 import org.grajagan.emporia.model.Channel;
 import org.grajagan.emporia.model.Readings;
+import org.grajagan.emporia.model.Scale;
 
 import java.net.URL;
 import java.time.Instant;
@@ -57,6 +60,9 @@ public class InfluxDBLoader {
     private final String influxDbBucket;
     private final String influxDbToken;
     private final String measurementName;
+    private static final String KWH = "kWh";
+    private static final String WATTS = "Watts";
+    private static final String AMPS = "Amps";
 
     private InfluxDBClient influxDBclient;
 
@@ -104,14 +110,33 @@ public class InfluxDBLoader {
         return false;
     }
 
-    public Readings load(Channel channel) {
+    private String GetField(Configuration configuration) {
+        Scale scale = (Scale) configuration.getProperty(EmporiaAPIService.SCALE);
+        String scaleString = scale.toString();
+        String field;
+
+        log.debug("Scale: " + scaleString);
+		if (scaleString.equals("1S")) {
+			field = WATTS;
+		} else {
+			field = KWH;
+		}
+        log.debug("field: " + field);
+
+        return field;
+    }
+
+    public Readings load(Channel channel, Configuration configuration) {
         if (!isConnected) {
             connect();
         }
         String deviceName = getNameForChannel(channel);
+        String field = GetField(configuration);
+
         String flux = "from(bucket: \"" + influxDbBucket + "\")\n" + "  |> range(start: -10y)\n"
                 + "  |> filter(fn: (r) => r[\"_measurement\"] == \"" + deviceName + "\")\n"
-                + "  |> filter(fn: (r) => r[\"_field\"] == \"watts\")\n" + "  |> last()";
+                //+ "  |> filter(fn: (r) => r[\"_field\"] == \"watts\")\n" + "  |> last()";
+                + "  |> filter(fn: (r) => r[\"_field\"] == \"" + field + "\")\n" + "  |> last()";
         QueryApi queryApi = influxDBclient.getQueryApi();
 
         Readings readings = new Readings();
@@ -130,7 +155,7 @@ public class InfluxDBLoader {
         return readings;
     }
 
-    public void save(Readings readings) {
+    public void save(Readings readings, Configuration configuration) {
         if (!isConnected) {
             connect();
         }
@@ -138,6 +163,8 @@ public class InfluxDBLoader {
         SortedMap<Instant, Float> data = readings.getDataPoints();
         Channel channel = readings.getChannel();
         String deviceName = getNameForChannel(channel);
+        String field = GetField(configuration);
+
 
         // apparently, the math is done on the server!
         float multiplier = 1f; // readings.getChannel().getChannelMultiplier();
@@ -160,10 +187,19 @@ public class InfluxDBLoader {
 
             if (channel.getName() != null && !channel.getName().equals("")) {
                 point.addTag("Device Name", channel.getName());
+            } else if (channel.getChannelNum().equals("1,2,3")) {
+                point.addTag("Device Name", "Total Usage_A");
+			} else {
+                point.addTag("Device Name", "Unset");
             }
 
             point.time(i.toEpochMilli(), WritePrecision.MS)
-                    .addField("watts", (int) (data.get(i) * multiplier * 100) / 100.0);
+                    .addField(field, (int) (data.get(i) * multiplier * 100) / 100.0);
+
+            if (field.equals(WATTS)) {
+				point.time(i.toEpochMilli(), WritePrecision.MS)
+                        .addField(AMPS, (int) (data.get(i) * multiplier / 230 * 100 ) / 100.0);
+			}
 
             log.debug("Created point: " + point.toLineProtocol());
             points.add(point);
@@ -176,5 +212,13 @@ public class InfluxDBLoader {
 
     private String getNameForChannel(Channel channel) {
         return channel.getDeviceGid() + "-" + channel.getChannelNum();
+    }
+
+    public void close() {
+        if (isConnected) {
+            influxDBclient.close();
+            log.debug("Closed influxDBclient");
+        	isConnected = false;
+        }
     }
 }
